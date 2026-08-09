@@ -1804,9 +1804,13 @@ def generate_scheduler_kv_cache_config(
     assert all(
         [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
     )
-    # All workers have the same kv_cache_config except layer names, so use
-    # an arbitrary one to initialize the scheduler.
-    cfg = copy.deepcopy(kv_cache_configs[0])
+    # Role-parallel workers can be cacheless. Initialize from a cache-owning
+    # worker so the scheduler retains the block-id groups used by SSM ranks.
+    source_cfg = next(
+        (cfg for cfg in kv_cache_configs if cfg.kv_cache_groups),
+        kv_cache_configs[0],
+    )
+    cfg = copy.deepcopy(source_cfg)
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
@@ -2015,8 +2019,14 @@ def _project_kv_cache_groups_to_worker(
         worker_layer_names = [
             layer_name for layer_name in group.layer_names if layer_name in worker_spec
         ]
+        if not worker_layer_names:
+            # Role-parallel workers such as Mamba SG gate ranks can own no
+            # cache layers. Do not leave an empty group behind: downstream
+            # cache sizing assumes every projected group has at least one
+            # layer.
+            continue
         group_spec = group.kv_cache_spec
-        if worker_layer_names and isinstance(group_spec, UniformTypeKVCacheSpecs):
+        if isinstance(group_spec, UniformTypeKVCacheSpecs):
             group_spec = UniformTypeKVCacheSpecs(
                 block_size=group_spec.block_size,
                 kv_cache_specs={
@@ -2153,8 +2163,11 @@ def get_kv_cache_configs(
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid
     # allocating unused memory.
+    cache_owning_configs = [
+        config for config in kv_cache_configs if config.kv_cache_groups
+    ]
     min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+        config.num_blocks for config in (cache_owning_configs or kv_cache_configs)
     )
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks

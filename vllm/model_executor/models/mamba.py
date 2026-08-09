@@ -11,10 +11,16 @@ from transformers import MambaConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.distributed.mamba_sg_parallel_state import (
+    MambaSGRole,
+    get_mamba_sg_role,
+)
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_mixer import MambaMixer
+from vllm.model_executor.layers.mamba.mamba_mixer_gate import MambaMixerGate
+from vllm.model_executor.layers.mamba.mamba_mixer_ssm import MambaMixerSSM
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -26,6 +32,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsAttentionFree,
@@ -36,7 +43,7 @@ from vllm.sequence import IntermediateTensors
 
 from .utils import (
     AutoWeightsLoader,
-    WeightsMapper,
+    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -53,14 +60,27 @@ class MambaDecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         is_lora_enabled: bool | None = False,
+        enable_mamba_sg: bool | None = False,
+        mamba_sg_role: MambaSGRole | None = None,
+        # use_gate_path: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
+        self.enable_mamba_sg = enable_mamba_sg
         self.is_falcon_mamba = config.model_type == "falcon_mamba"
         self.is_lora_enabled = is_lora_enabled
         mixer_rms_eps = config.mixer_rms_eps if self.is_falcon_mamba else None
-        self.mixer = MambaMixer(
+        mixer_cls = None
+
+        if not enable_mamba_sg:
+            mixer_cls = MambaMixer
+        elif mamba_sg_role == MambaSGRole.GATE:
+            mixer_cls = MambaMixerGate
+        else:
+            mixer_cls = MambaMixerSSM
+
+        self.mixer = mixer_cls(
             hidden_size=config.hidden_size,
             ssm_state_size=config.state_size,
             conv_kernel_size=config.conv_kernel,
@@ -102,12 +122,22 @@ class MambaModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
+        parallel_config = vllm_config.parallel_config
         config = vllm_config.model_config.hf_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         lora_config = vllm_config.lora_config
         is_lora_enabled = bool(lora_config)
+
+        self.enable_mamba_sg = parallel_config.enable_mamba_sg
+        if self.enable_mamba_sg:
+            branch_size = parallel_config.tensor_parallel_size // 2
+            gate_size = branch_size
+            ssm_size = branch_size
+        else:
+            gate_size = parallel_config.tensor_parallel_size
+            ssm_size = parallel_config.tensor_parallel_size
 
         self.config = config
 
@@ -118,6 +148,13 @@ class MambaModel(nn.Module):
             config.hidden_size,
         )
 
+        self.mamba_sg_role = None
+        if self.enable_mamba_sg:
+            self.mamba_sg_role = get_mamba_sg_role(
+                gate_parallel_size=gate_size,
+                ssm_parallel_size=ssm_size,
+            )
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: MambaDecoderLayer(
@@ -126,6 +163,8 @@ class MambaModel(nn.Module):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 is_lora_enabled=is_lora_enabled,
+                enable_mamba_sg=self.enable_mamba_sg,
+                mamba_sg_role=self.mamba_sg_role,
                 prefix=prefix,
             ),
             prefix=f"{prefix}.layers",
@@ -169,12 +208,34 @@ class MambaModel(nn.Module):
 
         return hidden_states
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+        for name, loaded_weight in weights:
+            if "A_log" in name:
+                name = name.replace("A_log", "A")
+            # Skip loading extra bias for GPTQ models.
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            if is_pp_missing_parameter(name, self):
+                continue
+            if name not in params_dict:
+                if self.enable_mamba_sg:
+                    # Gate-only layers intentionally omit all convolution,
+                    # SSM, and recurrent-state parameters.
+                    continue
+                raise KeyError(name)
+
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
+
 
 class MambaForCausalLM(
     nn.Module, HasInnerState, IsAttentionFree, SupportsPP, SupportsMambaPrefixCaching
 ):
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_substr={".A_log": ".A"})
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_config
 
@@ -217,7 +278,6 @@ class MambaForCausalLM(
         hidden_states = self.backbone(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
-
         return hidden_states
 
     @classmethod
@@ -240,7 +300,11 @@ class MambaForCausalLM(
         hf_config = vllm_config.model_config.hf_config
 
         return MambaStateShapeCalculator.mamba1_state_shape(
-            tp_world_size=parallel_config.tensor_parallel_size,
+            tp_world_size=(
+                parallel_config.tensor_parallel_size // 2
+                if parallel_config.enable_mamba_sg
+                else parallel_config.tensor_parallel_size
+            ),
             intermediate_size=hf_config.intermediate_size,
             state_size=hf_config.state_size,
             conv_kernel=hf_config.conv_kernel,
@@ -262,4 +326,4 @@ class MambaForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(weights)

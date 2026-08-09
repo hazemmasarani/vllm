@@ -161,6 +161,8 @@ class ParallelConfig:
     """Whether the deployed model is MoE (if known)."""
     enable_expert_parallel: bool = False
     """Use expert parallelism instead of tensor parallelism for MoE layers."""
+    enable_mamba_sg: bool = Field(default=False)
+    """Enable experimental Mamba SSM-Gate tensor parallelism."""
     enable_ep_weight_filter: bool = False
     """Skip non-local expert weights during model loading when expert
     parallelism is active.  Each rank only reads its own expert shard from

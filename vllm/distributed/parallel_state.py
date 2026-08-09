@@ -1370,6 +1370,22 @@ def get_tp_group() -> GroupCoordinator:
     return _TP
 
 
+_MAMBA_SG_BRANCH: GroupCoordinator | None = None
+_MAMBA_SG_PAIR: GroupCoordinator | None = None
+
+
+def get_mamba_sg_branch_group() -> GroupCoordinator:
+    assert _MAMBA_SG_BRANCH is not None, (
+        "Mamba SSM-Gate branch group is not initialized"
+    )
+    return _MAMBA_SG_BRANCH
+
+
+def get_mamba_sg_pair_group() -> GroupCoordinator:
+    assert _MAMBA_SG_PAIR is not None, "Mamba SSM-Gate pair group is not initialized"
+    return _MAMBA_SG_PAIR
+
+
 _DCP: GroupCoordinator | None = None
 
 
@@ -1818,6 +1834,35 @@ def initialize_model_parallel(
         group_name="tp",
     )
 
+    global _MAMBA_SG_BRANCH, _MAMBA_SG_PAIR
+    if parallel_config.enable_mamba_sg:
+        if tensor_model_parallel_size < 2 or tensor_model_parallel_size % 2:
+            raise ValueError(
+                "--enable-mamba-sg requires an even tensor parallel size of at least 2"
+            )
+        branch_group_ranks: list[list[int]] = []
+        pair_group_ranks: list[list[int]] = []
+        branch_size = tensor_model_parallel_size // 2
+        for tp_ranks in group_ranks:
+            gate_ranks = tp_ranks[:branch_size]
+            ssm_ranks = tp_ranks[branch_size:]
+            branch_group_ranks.extend((gate_ranks, ssm_ranks))
+            pair_group_ranks.extend(
+                [[gate_ranks[i], ssm_ranks[i]] for i in range(branch_size)]
+            )
+        _MAMBA_SG_BRANCH = init_model_parallel_group(
+            branch_group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="mamba_sg_branch",
+        )
+        _MAMBA_SG_PAIR = init_model_parallel_group(
+            pair_group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="mamba_sg_pair",
+        )
+
     # Build the DCP model-parallel groups.
     global _DCP
     assert _DCP is None, "decode context model parallel group is already initialized"
@@ -2054,6 +2099,16 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    global _MAMBA_SG_PAIR
+    if _MAMBA_SG_PAIR:
+        _MAMBA_SG_PAIR.destroy()
+    _MAMBA_SG_PAIR = None
+
+    global _MAMBA_SG_BRANCH
+    if _MAMBA_SG_BRANCH:
+        _MAMBA_SG_BRANCH.destroy()
+    _MAMBA_SG_BRANCH = None
+
     global _TP
 
     if _TP:
