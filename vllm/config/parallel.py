@@ -790,6 +790,13 @@ class ParallelConfig:
         return hash_factors(factors)
 
     def __post_init__(self) -> None:
+        if self.enable_mamba_sg and (
+            self.tensor_parallel_size < 2 or self.tensor_parallel_size % 2
+        ):
+            raise ValueError(
+                "enable_mamba_sg requires an even tensor_parallel_size of at least 2"
+            )
+
         # Continue with the rest of the initialization
         self.world_size = (
             self.pipeline_parallel_size

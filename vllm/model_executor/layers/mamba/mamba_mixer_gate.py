@@ -6,13 +6,18 @@ import torch
 from torch import nn
 from torch.nn.parameter import Parameter
 
-from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
+from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import (
     get_mamba_sg_branch_group,
     get_mamba_sg_pair_group,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
+    MambaStateShapeCalculator,
+)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -20,10 +25,12 @@ from vllm.utils.torch_utils import (
     _resolve_layer_name,
     direct_register_custom_op,
 )
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 
 @PluggableLayer.register("mamba_mixerGate")
-class MambaMixerGate(PluggableLayer):
+class MambaMixerGate(MambaBase, PluggableLayer):
     """Compute the raw gate projection and exchange it with an SSM rank."""
 
     def __init__(
@@ -52,6 +59,10 @@ class MambaMixerGate(PluggableLayer):
 
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+        self.ssm_state_size = ssm_state_size
+        self.conv_kernel_size = conv_kernel_size
+        self.model_config = model_config
+        self.cache_config = cache_config
         self.branch_group = get_mamba_sg_branch_group()
         self.pair_group = get_mamba_sg_pair_group()
         self.branch_rank = self.branch_group.rank_in_group
@@ -69,7 +80,7 @@ class MambaMixerGate(PluggableLayer):
         if self.in_proj.bias is not None:
             set_weight_attrs(self.in_proj.bias, {"weight_loader": self._load_bias})
 
-        self.layer_name = f"{prefix}.gate_path" if prefix else "gate_path"
+        self.layer_name = prefix or "gate_path"
         compilation_config = get_current_vllm_config().compilation_config
         if self.layer_name in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {self.layer_name}")
@@ -98,6 +109,36 @@ class MambaMixerGate(PluggableLayer):
             self.intermediate_size + self.branch_rank * self.local_intermediate_size
         )
         param.data.copy_(loaded_weight.narrow(0, offset, self.local_intermediate_size))
+
+    def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
+        assert self.model_config is not None
+        assert self.cache_config is not None
+        return MambaStateDtypeCalculator.mamba1_state_dtype(
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        return MambaStateShapeCalculator.mamba1_state_shape(
+            tp_world_size=self.branch_size,
+            intermediate_size=self.intermediate_size,
+            state_size=self.ssm_state_size,
+            conv_kernel=self.conv_kernel_size,
+        )
+
+    @property
+    def mamba_type(self) -> MambaAttentionBackendEnum:
+        return MambaAttentionBackendEnum.MAMBA1
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        # Hybrid models need every TP rank to expose the same cache groups.
+        # The gate rank does not read this state, but advertising the paired
+        # Mamba spec keeps Jamba's scheduler block tables rank-symmetric.
+        assert self.model_config is not None
+        if self.model_config.hf_config.model_type != "jamba":
+            return None
+        return super().get_kv_cache_spec(vllm_config)
 
     def forward(self, hidden_states: torch.Tensor, output: torch.Tensor) -> None:
         torch.ops.vllm.mamba_mixer_gate(

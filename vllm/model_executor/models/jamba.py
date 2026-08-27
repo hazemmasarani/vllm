@@ -12,6 +12,10 @@ from transformers import JambaConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.mamba_sg_parallel_state import (
+    MambaSGRole,
+    get_mamba_sg_role,
+)
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -26,6 +30,8 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_mixer import MambaMixer
+from vllm.model_executor.layers.mamba.mamba_mixer_gate import MambaMixerGate
+from vllm.model_executor.layers.mamba.mamba_mixer_ssm import MambaMixerSSM
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -124,13 +130,23 @@ class JambaMambaDecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         is_lora_enabled: bool | None = False,
+        enable_mamba_sg: bool = False,
+        mamba_sg_role: MambaSGRole | None = None,
         prefix: str = "",
         **kwargs,
     ) -> None:
         super().__init__()
         self.config = config
         self.is_lora_enabled = is_lora_enabled
-        self.mamba = MambaMixer(
+
+        if not enable_mamba_sg:
+            mixer_cls = MambaMixer
+        elif mamba_sg_role == MambaSGRole.GATE:
+            mixer_cls = MambaMixerGate
+        else:
+            mixer_cls = MambaMixerSSM
+
+        self.mamba = mixer_cls(
             hidden_size=config.hidden_size,
             ssm_state_size=config.mamba_d_state,
             conv_kernel_size=config.mamba_d_conv,
@@ -312,6 +328,16 @@ class JambaModel(nn.Module):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
 
+        parallel_config = vllm_config.parallel_config
+        self.enable_mamba_sg = parallel_config.enable_mamba_sg
+        self.mamba_sg_role = None
+        if self.enable_mamba_sg:
+            branch_size = parallel_config.tensor_parallel_size // 2
+            self.mamba_sg_role = get_mamba_sg_role(
+                gate_parallel_size=branch_size,
+                ssm_parallel_size=branch_size,
+            )
+
         self.config = config
 
         self.vocab_size = config.vocab_size
@@ -321,7 +347,11 @@ class JambaModel(nn.Module):
             config.hidden_size,
         )
 
-        extra_kwargs = {"is_lora_enabled": bool(vllm_config.lora_config)}
+        extra_kwargs = {
+            "is_lora_enabled": bool(vllm_config.lora_config),
+            "enable_mamba_sg": self.enable_mamba_sg,
+            "mamba_sg_role": self.mamba_sg_role,
+        }
 
         def get_layer(prefix: str):
             layer_idx = int(prefix.rsplit(".", 1)[1])
@@ -451,6 +481,11 @@ class JambaModel(nn.Module):
                     if is_pp_missing_parameter(name, self):
                         continue
 
+                    if name not in params_dict:
+                        if self.enable_mamba_sg and ".mamba." in name:
+                            # Each SG role intentionally owns only its branch.
+                            continue
+                        raise KeyError(name)
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
@@ -556,7 +591,11 @@ class JambaForCausalLM(
         hidden_size = hf_config.hidden_size
 
         return MambaStateShapeCalculator.mamba1_state_shape(
-            tp_world_size=parallel_config.tensor_parallel_size,
+            tp_world_size=(
+                parallel_config.tensor_parallel_size // 2
+                if parallel_config.enable_mamba_sg
+                else parallel_config.tensor_parallel_size
+            ),
             intermediate_size=hf_config.mamba_expand * hidden_size,
             state_size=hf_config.mamba_d_state,
             conv_kernel=hf_config.mamba_d_conv,

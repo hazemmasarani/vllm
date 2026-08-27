@@ -2303,7 +2303,7 @@ def topk_softmax(
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
 ) -> None:
-    torch.ops._moe_C.topk_softmax(
+    args = (
         topk_weights,
         topk_ids,
         token_expert_indices,
@@ -2311,6 +2311,13 @@ def topk_softmax(
         renormalize,
         e_score_correction_bias,
     )
+    op = torch.ops._moe_C.topk_softmax.default
+    if len(op._schema.arguments) >= 7:
+        # Keep source checkouts compatible with extension builds that include
+        # the optional DP-padding mask argument.
+        op(*args, None)
+    else:
+        op(*args)
 
 
 def topk_sigmoid(
