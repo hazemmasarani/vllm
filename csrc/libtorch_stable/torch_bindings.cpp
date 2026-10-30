@@ -584,11 +584,11 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // Post processing for GPTQ.
   ops.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
 
-  // Mamba selective scan kernel
+  // Mamba selective scan kernels
   ops.def(
-      "selective_scan_fwd(Tensor! u, Tensor! delta,"
+      "selective_scan_ssm_fwd(Tensor! u, Tensor! delta,"
       "Tensor! A, Tensor! B, Tensor! C,"
-      "Tensor? D_, Tensor!? z_, Tensor? delta_bias_,"
+      "Tensor? D_, Tensor? delta_bias_,"
       "bool delta_softplus,"
       "Tensor? query_start_loc,"
       "Tensor? cache_indices,"
@@ -601,6 +601,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor? initial_state_idx,"
       "Tensor? cu_chunk_seqlen,"
       "Tensor? last_chunk_indices) -> ()");
+  ops.def("selective_scan_gate_fwd(Tensor! z) -> ()");
 
   // LongCat n-gram embedding index kernel. All tensor args are marked mutable
   // to match the (non-const) stable-Tensor& C++ signature; only ne_token_table
@@ -736,7 +737,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("gptq_shuffle", TORCH_BOX(&gptq_shuffle));
 
   // Mamba kernels
-  ops.impl("selective_scan_fwd", TORCH_BOX(&selective_scan_fwd));
+  ops.impl("selective_scan_ssm_fwd", TORCH_BOX(&selective_scan_ssm_fwd));
+  ops.impl("selective_scan_gate_fwd", TORCH_BOX(&selective_scan_gate_fwd));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CPU, ops) {

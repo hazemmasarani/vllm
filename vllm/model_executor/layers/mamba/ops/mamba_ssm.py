@@ -701,7 +701,7 @@ def selective_state_update(
         )
 
 
-def selective_scan_fn(
+def _selective_scan_xpu_fwd(
     u,
     ssm_states,
     delta,
@@ -794,32 +794,134 @@ def selective_scan_fn(
     if C.dim() == 2 and query_start_loc is not None:
         C = C.unsqueeze(0)
 
-    if current_platform.is_xpu():
-        xpu_ops.selective_scan_fwd(
-            u,
-            delta,
-            A,
-            B,
-            C,
-            D,
-            z,
-            delta_bias,
-            delta_softplus,
-            query_start_loc,
-            cache_indices,
-            has_initial_state,
-            ssm_states,
-            null_block_id,
-            block_size,
-            block_idx_first_scheduled_token,
-            block_idx_last_scheduled_token,
-            initial_state_idx,
-            cu_chunk_seqlen,
-            last_chunk_indices,
-        )
+    assert current_platform.is_xpu()
+    xpu_ops.selective_scan_fwd(
+        u,
+        delta,
+        A,
+        B,
+        C,
+        D,
+        z,
+        delta_bias,
+        delta_softplus,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        ssm_states,
+        null_block_id,
+        block_size,
+        block_idx_first_scheduled_token,
+        block_idx_last_scheduled_token,
+        initial_state_idx,
+        cu_chunk_seqlen,
+        last_chunk_indices,
+    )
+
+    if z is None:
+        return delta  # output written inplace to delta
     else:
-        ops.selective_scan_fwd(
+        return z  # output written inplace to z
+
+
+def selective_scan_ssm_fn(
+    u,
+    ssm_states,
+    delta,
+    A,
+    B,
+    C,
+    D=None,
+    delta_bias=None,
+    delta_softplus=False,
+    query_start_loc=None,
+    cache_indices=None,
+    has_initial_state=None,
+    null_block_id=NULL_BLOCK_ID,
+    block_size=1024,
+    block_idx_first_scheduled_token=None,
+    block_idx_last_scheduled_token=None,
+    initial_state_idx=None,
+    cu_chunk_seqlen=None,
+    last_chunk_indices=None,
+) -> torch.Tensor:
+    """Run the ungated CUDA/HIP selective SSM scan in place on ``delta``."""
+    if u.stride(-1) != 1:
+        u = u.contiguous()
+    if delta.stride(-1) != 1:
+        delta = delta.contiguous()
+    if D is not None:
+        D = D.contiguous()
+    if B.stride(-1) != 1:
+        B = B.contiguous()
+    if C.stride(-1) != 1:
+        C = C.contiguous()
+    if B.dim() == 3 and query_start_loc is None:
+        B = B.unsqueeze(1)
+    if B.dim() == 2 and query_start_loc is not None:
+        B = B.unsqueeze(0)
+    if C.dim() == 3 and query_start_loc is None:
+        C = C.unsqueeze(1)
+    if C.dim() == 2 and query_start_loc is not None:
+        C = C.unsqueeze(0)
+
+    ops.selective_scan_ssm_fwd(
+        u,
+        delta,
+        A,
+        B,
+        C,
+        D,
+        delta_bias,
+        delta_softplus,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        ssm_states,
+        null_block_id,
+        block_size,
+        block_idx_first_scheduled_token,
+        block_idx_last_scheduled_token,
+        initial_state_idx,
+        cu_chunk_seqlen,
+        last_chunk_indices,
+    )
+    return delta
+
+
+def selective_scan_gate_fn(z: torch.Tensor) -> torch.Tensor:
+    """Overwrite ``z`` with ``SiLU(z)`` using the gate-only CUDA/HIP kernel."""
+    ops.selective_scan_gate_fwd(z)
+    return z
+
+
+def selective_scan_fn(
+    u,
+    ssm_states,
+    delta,
+    A,
+    B,
+    C,
+    D=None,
+    z=None,
+    delta_bias=None,
+    delta_softplus=False,
+    query_start_loc=None,
+    cache_indices=None,
+    has_initial_state=None,
+    null_block_id=NULL_BLOCK_ID,
+    block_size=1024,
+    block_idx_first_scheduled_token=None,
+    block_idx_last_scheduled_token=None,
+    initial_state_idx=None,
+    cu_chunk_seqlen=None,
+    last_chunk_indices=None,
+) -> torch.Tensor:
+    """Compatibility wrapper for the complete selective-scan operation."""
+    if current_platform.is_xpu():
+        return _selective_scan_xpu_fwd(
             u,
+            ssm_states,
             delta,
             A,
             B,
@@ -831,7 +933,6 @@ def selective_scan_fn(
             query_start_loc,
             cache_indices,
             has_initial_state,
-            ssm_states,
             null_block_id,
             block_size,
             block_idx_first_scheduled_token,
@@ -841,7 +942,30 @@ def selective_scan_fn(
             last_chunk_indices,
         )
 
+    ssm_out = selective_scan_ssm_fn(
+        u,
+        ssm_states,
+        delta,
+        A,
+        B,
+        C,
+        D,
+        delta_bias,
+        delta_softplus,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        null_block_id,
+        block_size,
+        block_idx_first_scheduled_token,
+        block_idx_last_scheduled_token,
+        initial_state_idx,
+        cu_chunk_seqlen,
+        last_chunk_indices,
+    )
     if z is None:
-        return delta  # output written inplace to delta
-    else:
-        return z  # output written inplace to z
+        return ssm_out
+
+    gate_out = selective_scan_gate_fn(z)
+    gate_out.mul_(ssm_out)
+    return gate_out

@@ -11,6 +11,7 @@ from tests.kernels.utils import opcheck
 from vllm import _custom_ops as ops  # noqa: F401
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
     selective_scan_fn,
+    selective_scan_gate_fn,
     selective_state_update,
 )
 from vllm.platforms import current_platform
@@ -24,9 +25,9 @@ pytestmark = pytest.mark.skipif(
     reason="mamba_ssm kernels require CUDA-alike or XPU",
 )
 
-# selective_scan_fn is backed by the CUDA-only `ops.selective_scan_fwd` C++ op,
-# so tests exercising it must be skipped on XPU. selective_state_update is
-# pure Triton and runs on both CUDA-alike and XPU.
+# selective_scan_fn is backed by CUDA/HIP-only SSM and gate C++ ops, so tests
+# exercising it must be skipped on XPU. selective_state_update is pure Triton
+# and runs on both CUDA-alike and XPU.
 skip_unless_cuda_alike = pytest.mark.skipif(
     not current_platform.is_cuda_alike(),
     reason="selective_scan_fn uses CUDA-only custom op",
@@ -158,7 +159,7 @@ def selective_scan_opcheck_fn(
     # Disable test_autograd_registration for now as it seems to trigger
     # a bogus error.
     opcheck(
-        torch.ops._C.selective_scan_fwd,
+        torch.ops._C.selective_scan_ssm_fwd,
         (
             u,
             delta,
@@ -166,7 +167,6 @@ def selective_scan_opcheck_fn(
             B,
             C,
             D,
-            z,
             delta_bias,
             delta_softplus,
             cu_seq_len,
@@ -183,6 +183,36 @@ def selective_scan_opcheck_fn(
         ),
         test_utils=["test_schema", "test_faketensor"],
     )
+    if z is not None:
+        opcheck(
+            torch.ops._C.selective_scan_gate_fwd,
+            (z,),
+            test_utils=["test_schema", "test_faketensor"],
+        )
+
+
+@pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("rank", [2, 3])
+@skip_unless_cuda_alike
+def test_selective_scan_gate(itype, rank):
+    logical_shape = (5, 17) if rank == 2 else (2, 5, 17)
+    storage_shape = (*logical_shape[:-1], logical_shape[-1] + 3)
+    storage = torch.randn(storage_shape, device="cuda", dtype=itype)
+    z = storage[..., 1 : logical_shape[-1] + 1]
+    z_ref = z.float().clone()
+    original_data_ptr = z.data_ptr()
+    original_stride = z.stride()
+
+    result = selective_scan_gate_fn(z)
+
+    rtol, atol = {
+        torch.float32: (1e-6, 1e-6),
+        torch.float16: (2e-3, 2e-3),
+        torch.bfloat16: (2e-2, 2e-2),
+    }[itype]
+    assert result.data_ptr() == original_data_ptr
+    assert result.stride() == original_stride
+    assert torch.allclose(result.float(), F.silu(z_ref), rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("wtype", [torch.float32])
@@ -190,7 +220,7 @@ def selective_scan_opcheck_fn(
 @pytest.mark.parametrize("seqlen", [128, 1024, 4096])
 @pytest.mark.parametrize("has_delta_bias", [True])
 @pytest.mark.parametrize("delta_softplus", [True])
-@pytest.mark.parametrize("has_z", [True])
+@pytest.mark.parametrize("has_z", [False, True])
 @pytest.mark.parametrize("has_D", [True])
 @pytest.mark.parametrize("varBC_groups", [1, 2])
 @pytest.mark.parametrize("is_variable_C", [True])

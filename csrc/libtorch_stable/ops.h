@@ -346,12 +346,11 @@ void cooperative_topk(const torch::stable::Tensor& logits,
                       int64_t max_seq_len);
 #endif
 
-void selective_scan_fwd(
+void selective_scan_ssm_fwd(
     const torch::stable::Tensor& u, const torch::stable::Tensor& delta,
     const torch::stable::Tensor& A, const torch::stable::Tensor& B,
     const torch::stable::Tensor& C,
     const std::optional<torch::stable::Tensor>& D_,
-    const std::optional<torch::stable::Tensor>& z_,
     const std::optional<torch::stable::Tensor>& delta_bias_,
     bool delta_softplus,
     const std::optional<torch::stable::Tensor>& query_start_loc,
@@ -364,6 +363,8 @@ void selective_scan_fwd(
     const std::optional<torch::stable::Tensor>& initial_state_idx,
     const std::optional<torch::stable::Tensor>& cu_chunk_seqlen,
     const std::optional<torch::stable::Tensor>& last_chunk_indices);
+
+void selective_scan_gate_fwd(const torch::stable::Tensor& z);
 
 using fptr_t = int64_t;
 fptr_t init_custom_ar(const std::vector<int64_t>& fake_ipc_ptrs,

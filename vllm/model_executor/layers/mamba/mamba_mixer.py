@@ -30,7 +30,11 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from vllm.model_executor.layers.mamba.ops.mamba_ssm import selective_scan_fn
+from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
+    selective_scan_fn,
+    selective_scan_gate_fn,
+    selective_scan_ssm_fn,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import selective_state_update
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -371,27 +375,51 @@ class MambaMixer(MambaBase, PluggableLayer):
             time_proj_bias = self._time_proj_bias()
 
             # 4. Perform the recurrence y ← SSM(A, B, C, Δ)(x)
-            scan_out_p = selective_scan_fn(
-                conv_out_p,
-                ssm_state,
-                discrete_time_step_p,
-                self.A,
-                B_p.transpose(-2, -1),
-                C_p.transpose(-2, -1),
-                self.D.float(),
-                gate_p,
-                time_proj_bias,
-                delta_softplus=True,
-                cache_indices=state_indices_tensor_p,
-                has_initial_state=has_initial_states_p,
-                query_start_loc=query_start_loc_p,
-                block_size=mamba_block_size,
-                block_idx_first_scheduled_token=block_idx_first_scheduled_token_p,
-                block_idx_last_scheduled_token=block_idx_last_scheduled_token_p,
-                initial_state_idx=block_idx_last_computed_token_p,
-                cu_chunk_seqlen=cu_chunk_seqlen_p,
-                last_chunk_indices=last_chunk_indices_p,
-            )
+            if current_platform.is_xpu():
+                scan_out_p = selective_scan_fn(
+                    conv_out_p,
+                    ssm_state,
+                    discrete_time_step_p,
+                    self.A,
+                    B_p.transpose(-2, -1),
+                    C_p.transpose(-2, -1),
+                    self.D.float(),
+                    gate_p,
+                    time_proj_bias,
+                    delta_softplus=True,
+                    cache_indices=state_indices_tensor_p,
+                    has_initial_state=has_initial_states_p,
+                    query_start_loc=query_start_loc_p,
+                    block_size=mamba_block_size,
+                    block_idx_first_scheduled_token=block_idx_first_scheduled_token_p,
+                    block_idx_last_scheduled_token=block_idx_last_scheduled_token_p,
+                    initial_state_idx=block_idx_last_computed_token_p,
+                    cu_chunk_seqlen=cu_chunk_seqlen_p,
+                    last_chunk_indices=last_chunk_indices_p,
+                )
+            else:
+                ssm_out_p = selective_scan_ssm_fn(
+                    conv_out_p,
+                    ssm_state,
+                    discrete_time_step_p,
+                    self.A,
+                    B_p.transpose(-2, -1),
+                    C_p.transpose(-2, -1),
+                    self.D.float(),
+                    time_proj_bias,
+                    delta_softplus=True,
+                    cache_indices=state_indices_tensor_p,
+                    has_initial_state=has_initial_states_p,
+                    query_start_loc=query_start_loc_p,
+                    block_size=mamba_block_size,
+                    block_idx_first_scheduled_token=block_idx_first_scheduled_token_p,
+                    block_idx_last_scheduled_token=block_idx_last_scheduled_token_p,
+                    initial_state_idx=block_idx_last_computed_token_p,
+                    cu_chunk_seqlen=cu_chunk_seqlen_p,
+                    last_chunk_indices=last_chunk_indices_p,
+                )
+                scan_out_p = selective_scan_gate_fn(gate_p)
+                scan_out_p.mul_(ssm_out_p)
             ssm_outputs.append(scan_out_p)
 
         if has_decode:

@@ -44,12 +44,8 @@ struct SSMParamsBase {
     index_t u_d_stride;
     index_t delta_batch_stride;
     index_t delta_d_stride;
-    index_t z_batch_stride;
-    index_t z_d_stride;
     index_t out_batch_stride;
     index_t out_d_stride;
-    index_t out_z_batch_stride;
-    index_t out_z_d_stride;
     index_t ssm_states_batch_stride;
     index_t ssm_states_dim_stride;
     index_t ssm_states_dstate_stride;
@@ -65,9 +61,6 @@ struct SSMParamsBase {
     void *__restrict__ delta_bias_ptr;
     void *__restrict__ out_ptr;
     void *__restrict__ ssm_states_ptr;
-    void *__restrict__ z_ptr;
-    void *__restrict__ out_z_ptr;
-
     void *__restrict__ query_start_loc_ptr;
     void *__restrict__ cache_indices_ptr;
     void *__restrict__ has_initial_state_ptr;

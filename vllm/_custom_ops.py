@@ -2024,14 +2024,13 @@ def scaled_int8_quant(
 
 
 # mamba
-def selective_scan_fwd(
+def selective_scan_ssm_fwd(
     u: torch.Tensor,
     delta: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
     D_: torch.Tensor | None,
-    z_: torch.Tensor | None,
     delta_bias_: torch.Tensor | None,
     delta_softplus: bool,
     query_start_loc: torch.Tensor | None,
@@ -2046,14 +2045,13 @@ def selective_scan_fwd(
     cu_chunk_seqlen: torch.Tensor | None = None,
     last_chunk_indices: torch.Tensor | None = None,
 ):
-    torch.ops._C.selective_scan_fwd(
+    torch.ops._C.selective_scan_ssm_fwd(
         u,
         delta,
         A,
         B,
         C,
         D_,
-        z_,
         delta_bias_,
         delta_softplus,
         query_start_loc,
@@ -2068,6 +2066,10 @@ def selective_scan_fwd(
         cu_chunk_seqlen,
         last_chunk_indices,
     )
+
+
+def selective_scan_gate_fwd(z: torch.Tensor) -> None:
+    torch.ops._C.selective_scan_gate_fwd(z)
 
 
 # ROCm skinny gemms
