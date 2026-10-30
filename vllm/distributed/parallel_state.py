@@ -1267,6 +1267,20 @@ class GroupCoordinator:
         else:
             return hidden_states
 
+    def all_to_all_single(
+        self,
+        send_tensor: torch.Tensor,
+        receive_tensor: torch.Tensor,
+        send_split_sizes: list[int] | None = None,
+        recv_split_sizes: list[int] | None = None,
+    ) -> torch.Tensor:
+        if self.device_communicator is not None:
+            return self.device_communicator.all_to_all_single(
+                send_tensor, receive_tensor, send_split_sizes, recv_split_sizes
+            )
+        else:
+            return receive_tensor
+
 
 _WORLD: GroupCoordinator | None = None
 _INNER_DP_WORLD: GroupCoordinator | None = None

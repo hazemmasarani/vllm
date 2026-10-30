@@ -262,6 +262,22 @@ class DeviceCommunicatorBase:
     ) -> torch.Tensor:
         raise NotImplementedError
 
+    def all_to_all_single(
+        self,
+        send_tensor: torch.Tensor,
+        receive_tensor: torch.Tensor,
+        send_split_sizes: list[int] | None = None,
+        recv_split_sizes: list[int] | None = None,
+    ) -> torch.Tensor:
+        dist.all_to_all_single(
+            receive_tensor,
+            send_tensor,
+            output_split_sizes=recv_split_sizes,
+            input_split_sizes=send_split_sizes,
+            group=self.device_group,
+        )
+        return receive_tensor
+
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
     ) -> torch.Tensor | None:

@@ -149,8 +149,8 @@ class MambaMixerGate(MambaBase, PluggableLayer):
         # Keep the channel-first layout used by the Mamba kernels. The paired
         # SSM rank owns the recurrence and applies this raw projection as z.
         gate = self.in_proj(hidden_states).transpose(-2, -1).contiguous()
-        self.pair_group.send(gate, dst=1)
-        self.pair_group.broadcast(output, src=1)
+        split_sizes = [self.local_intermediate_size] * self.pair_group.world_size
+        self.pair_group.all_to_all_single(gate, output, split_sizes, split_sizes)
 
 
 def mamba_mixer_gate(
