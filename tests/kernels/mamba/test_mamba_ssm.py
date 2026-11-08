@@ -338,6 +338,110 @@ def test_selective_scan(
     )
 
 
+@pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("seqlen", [128, 1024, 4096])
+@pytest.mark.parametrize("varBC_groups", [1, 2])
+@skip_unless_cuda_alike
+def test_selective_scan_split_matches_fused(itype, seqlen, varBC_groups):
+    set_random_seed(0)
+    device = "cuda"
+    batch_size = 1
+    dim = 4
+    dstate = 8
+
+    A = -0.5 * torch.rand(dim, dstate, device=device, dtype=torch.float32)
+    B = torch.randn(
+        batch_size,
+        varBC_groups,
+        dstate,
+        seqlen,
+        device=device,
+        dtype=itype,
+    )
+    C = torch.randn_like(B)
+    D = torch.randn(dim, device=device, dtype=torch.float32)
+    z = torch.randn(batch_size, dim, seqlen, device=device, dtype=itype)
+    delta_bias = 0.5 * torch.rand(dim, device=device, dtype=torch.float32)
+    u = torch.randn(batch_size, dim, seqlen, device=device, dtype=itype)
+    delta = 0.5 * torch.rand(batch_size, dim, seqlen, device=device, dtype=itype)
+    initial_state = torch.randn(batch_size, dim, dstate, device=device, dtype=itype)
+    has_initial_state = torch.ones(batch_size, device=device, dtype=torch.bool)
+
+    fused_delta = delta.clone()
+    fused_z = z.clone()
+    fused_state = initial_state.clone()
+    torch.ops._C.selective_scan_fwd(
+        u,
+        fused_delta,
+        A,
+        B,
+        C,
+        D,
+        fused_z,
+        delta_bias,
+        True,
+        None,
+        None,
+        has_initial_state,
+        fused_state,
+        NULL_BLOCK_ID,
+        2048,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+    split_delta = delta.clone()
+    split_z = z.clone()
+    split_state = initial_state.clone()
+    torch.ops._C.ssm_path_fwd(
+        u,
+        split_delta,
+        A,
+        B,
+        C,
+        D,
+        delta_bias,
+        True,
+        None,
+        None,
+        has_initial_state,
+        split_state,
+        NULL_BLOCK_ID,
+        2048,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    torch.ops._C.gate_path_fwd(split_z)
+    split_output = split_delta * split_z
+
+    rtol, atol, rmse_tolerance = {
+        torch.float32: (1e-5, 1e-5, 1e-5),
+        torch.float16: (3e-3, 5e-3, 5e-3),
+        torch.bfloat16: (3e-2, 5e-2, 5e-2),
+    }[itype]
+    case = f"dtype={itype}, seqlen={seqlen}, groups={varBC_groups}"
+    rmse = torch.sqrt(torch.mean((fused_z.float() - split_output.float()) ** 2))
+
+    assert rmse.item() <= rmse_tolerance, (
+        f"{case}: RMSE {rmse.item()} exceeds {rmse_tolerance}"
+    )
+    assert torch.allclose(fused_z, split_output, rtol=rtol, atol=atol), (
+        f"{case}: fused and split outputs are not close; RMSE={rmse.item()}"
+    )
+    assert torch.allclose(fused_delta, split_delta, rtol=rtol, atol=atol), (
+        f"{case}: ungated SSM outputs are not close"
+    )
+    assert torch.allclose(fused_state, split_state, rtol=rtol, atol=atol), (
+        f"{case}: final SSM states are not close"
+    )
+
+
 @pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("has_z", [False, True])
 @pytest.mark.parametrize("dstate", [16, 64])

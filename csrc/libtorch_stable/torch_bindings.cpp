@@ -601,6 +601,23 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor? initial_state_idx,"
       "Tensor? cu_chunk_seqlen,"
       "Tensor? last_chunk_indices) -> ()");
+  ops.def(
+      "ssm_path_fwd(Tensor! u, Tensor! delta,"
+      "Tensor! A, Tensor! B, Tensor! C,"
+      "Tensor? D, Tensor? delta_bias,"
+      "bool delta_softplus,"
+      "Tensor? query_start_loc,"
+      "Tensor? cache_indices,"
+      "Tensor? has_initial_state,"
+      "Tensor! ssm_states,"
+      "int null_block_id,"
+      "int block_size,"
+      "Tensor? block_idx_first_scheduled_token,"
+      "Tensor? block_idx_last_scheduled_token,"
+      "Tensor? initial_state_idx,"
+      "Tensor? cu_chunk_seqlen,"
+      "Tensor? last_chunk_indices) -> ()");
+  ops.def("gate_path_fwd(Tensor! z) -> ()");
 
   // LongCat n-gram embedding index kernel. All tensor args are marked mutable
   // to match the (non-const) stable-Tensor& C++ signature; only ne_token_table
@@ -737,6 +754,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 
   // Mamba kernels
   ops.impl("selective_scan_fwd", TORCH_BOX(&selective_scan_fwd));
+  ops.impl("ssm_path_fwd", TORCH_BOX(&ssm_path_fwd));
+  ops.impl("gate_path_fwd", TORCH_BOX(&gate_path_fwd));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CPU, ops) {
